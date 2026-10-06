@@ -1,0 +1,62 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {createHash,randomBytes} from 'node:crypto';
+import {readFileSync,readdirSync} from 'node:fs';
+import path from 'node:path';
+import {planMonth,addPlanMonths} from '../lib/member-plan-calendar.ts';
+const require=createRequire(import.meta.url);
+const {Miniflare}=createRequire(require.resolve('wrangler/package.json'))('miniflare');
+const root=path.resolve(import.meta.dirname,'..'),serverRoot=path.join(root,'dist/server');
+const files=readdirSync(serverRoot,{recursive:true}).filter(name=>name.endsWith('.js')&&name!=='index.js');
+const setupKey=randomBytes(32).toString('base64url'),password=randomBytes(24).toString('base64url');
+const worker=new Miniflare({modulesRoot:serverRoot,modules:['index.js',...files].map(name=>({type:'ESModule',path:path.join(serverRoot,name)})),compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:{DB:'member-payment-test'},bindings:{VUKOVA_SETUP_TOKEN_SHA256:createHash('sha256').update(setupKey).digest('hex')}});
+async function call(route,{body,cookie}={}) {
+  const response=await worker.dispatchFetch(`https://vukova.test${route}`,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',Origin:'https://vukova.test',...(cookie?{Cookie:cookie}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  return {status:response.status,body:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]};
+}
+const requestId=()=>randomBytes(18).toString('hex');
+try {
+ const db=await worker.getD1Database('DB');
+ for(const name of readdirSync(path.join(root,'drizzle')).filter(name=>name.endsWith('.sql')).sort())await db.batch(readFileSync(path.join(root,'drizzle',name),'utf8').split('--> statement-breakpoint').map(s=>s.trim()).filter(Boolean).map(s=>db.prepare(s)));
+ const admin=await call('/api/auth/setup',{body:{setupKey,displayName:'Admin',username:'flow.admin',password,confirmPassword:password}});assert.equal(admin.status,201,JSON.stringify(admin));
+ const cookie=admin.cookie;
+ const base={planId:'gym-1',saleOn:'2026-08-19',terminal:'cash',cardInstallments:null,amountCents:15000000,surchargeBps:0,fees:{}};
+ const post=body=>call('/api/payments',{cookie,body:{...base,...body,requestId:requestId()}});
+ async function create(name){const r=await post({action:'new_member',newMember:{name,branchId:'branch-acassuso',service:'gym'}});assert.equal(r.status,201,JSON.stringify(r));return r.body.member.id;}
+ const continuedId=await create('CONTINUA TEST'),restartId=await create('RETOMA TEST');
+ await db.prepare("INSERT INTO attendance (id,member_id,branch_id,method,checked_in_at,created_at,updated_at) VALUES ('visit',?,'branch-victoria','manual','2026-09-23T18:00:00Z','2026-09-23','2026-09-23')").bind(continuedId).run();
+ let c=await call(`/api/payments/context?memberId=${continuedId}&paidOn=2026-09-29`,{cookie});assert.equal(c.status,200,JSON.stringify(c));
+ assert.equal(c.body.renewal.previousEndsOn,'2026-09-19');assert.equal(c.body.renewal.startsOn,'2026-09-19');assert.deepEqual(c.body.renewal.attendanceDates,['2026-09-23']);
+ const renewal={action:'renewal',planId:'gym-6-2',saleOn:'2026-09-29',amountCents:36000000};
+ const paid=await post({...renewal,memberId:continuedId});assert.equal(paid.status,201,JSON.stringify(paid));assert.equal(paid.body.sale.startsOn,'2026-09-19');
+ const sale=await db.prepare('SELECT sale_on,plan_starts_on FROM sales_plan_scenarios WHERE id=?').bind(paid.body.sale.id).first();assert.equal(sale.sale_on,'2026-09-29');assert.equal(sale.plan_starts_on,'2026-09-19');
+ c=await call(`/api/payments/context?memberId=${continuedId}&paidOn=2026-09-30`,{cookie});assert.equal(c.body.installment.number,2);assert.equal(c.body.installment.dueOn,'2026-10-19');assert.equal(c.body.installment.amountCents,36000000);
+ const roster=(await call('/api/members',{cookie})).body.members.find(m=>m.id===continuedId);assert.equal(planMonth(roster,'2027-03','2026-09-30').endsOn,'2027-03-19');
+ let restart=await call(`/api/payments/context?memberId=${restartId}&paidOn=2026-09-29`,{cookie});assert.equal(restart.body.renewal.startsOn,'2026-09-29');assert.equal(restart.body.renewal.requiresConfirmation,true);
+ assert.equal((await post({...renewal,memberId:restartId})).status,400,'Missing attendance coverage needs a confirmation.');
+ const restarted=await post({...renewal,memberId:restartId,renewalConfirmed:true});assert.equal(restarted.status,201,JSON.stringify(restarted));assert.equal(restarted.body.sale.startsOn,'2026-09-29');
+ const offer={id:'gym-6-2',label:'Semestral nuevo precio',service:'gym',currency:'ARS',months:6,installments:2,amountCents:50000000,methods:['cash','transfer'],surchargeBps:1000,active:true};
+ assert.equal((await call('/api/plans',{cookie,body:{period:'2026-09',branchIds:['branch-acassuso','branch-victoria'],plan:offer}})).status,200);
+ const september=await call('/api/plans?period=2026-09&branch=branch-acassuso',{cookie});assert.equal(september.body.rows[0].plans.find(p=>p.id==='gym-6-2').amountCents,50000000);
+ const october=await call('/api/plans?period=2026-10&branch=branch-acassuso',{cookie});assert.equal(october.body.rows[0].plans.find(p=>p.id==='gym-6-2').amountCents,36000000,'Catalog edits are limited to their month.');
+ c=await call(`/api/payments/context?memberId=${continuedId}&paidOn=2026-09-30`,{cookie});assert.equal(c.body.installment.amountCents,36000000,'Existing contracts retain their price.');
+ assert.equal((await post({action:'installment',memberId:continuedId,planId:'gym-6-2',saleOn:'2026-09-30',installmentNumber:2,amountCents:50000000})).status,409);
+ const quota=await post({action:'installment',memberId:continuedId,planId:'gym-6-2',saleOn:'2026-09-30',installmentNumber:2,amountCents:36000000});assert.equal(quota.status,201,JSON.stringify(quota));
+ assert.equal((await db.prepare('SELECT due_on FROM payments WHERE id=?').bind(quota.body.paymentId).first()).due_on,'2026-10-19');
+ assert.equal((await call(`/api/payments/context?memberId=${continuedId}&paidOn=2026-09-30`,{cookie})).body.installment,null);
+ const rows=(await call('/api/collections?period=2026-09&branch=branch-acassuso',{cookie})).body;assert.equal(rows.total,3);assert.equal(rows.totals[0].grossCents,108000000,'Monthly receipts count payments on their actual collection date.');
+ assert.equal((await call('/api/collections?period=2026-08&branch=branch-acassuso',{cookie})).body.total,2);
+ const sheetMember=await create('SHEET CONTINUITY TEST');
+ await db.prepare("INSERT INTO sheet_rosters (id,member_id,source_sheet_id,source_row,source_name,normalized_name,service,source_state,history_json,review_json,imported_at) VALUES ('sheet-context',?,1,1,'SHEET CONTINUITY TEST','SHEET CONTINUITY TEST','gym','R','[]','[]','2026-09-30')").bind(sheetMember).run();
+ await db.prepare("INSERT INTO sheet_imports (id,branch_id,kind,sheet_name,spreadsheet_id,sheet_id,period,record_count,review_json,synced_at) VALUES ('sheet-context-import','branch-acassuso','attendance','SEPTIEMBRE','test',1,'2026-09',1,'{\"version\":\"latest\"}','2026-09-30T18:00:00Z')").run();
+ await db.prepare("INSERT INTO sheet_attendance (id,import_id,normalized_name,source_name,attended_on,marker,source_rows_json,version,created_at) VALUES ('sheet-visit','sheet-context-import','SHEET CONTINUITY TEST','SHEET CONTINUITY TEST','2026-09-22','1','[1]','latest','2026-09-30')").run();
+ const sheetContext=await call(`/api/payments/context?memberId=${sheetMember}&paidOn=2026-09-29`,{cookie});assert.equal(sheetContext.status,200,JSON.stringify(sheetContext));assert.equal(sheetContext.body.renewal.startsOn,'2026-09-19');assert.deepEqual(sheetContext.body.renewal.attendanceDates,['2026-09-22']);
+ const custom=await call('/api/plans',{cookie,body:{period:'2026-09',branchIds:['branch-acassuso'],plan:{...offer,id:undefined,label:'Plan especial',amountCents:12000000,months:3,installments:1}}});assert.equal(custom.status,200);
+ const newSale=await post({action:'new_member',newMember:{name:'CUSTOM TEST',branchId:'branch-acassuso',service:'gym'},planId:custom.body.planId,saleOn:'2026-09-30',amountCents:12000000});assert.equal(newSale.status,201,JSON.stringify(newSale));
+ await db.prepare("UPDATE employees SET role='branch_manager',branch_scope='branch-victoria' WHERE username='flow.admin'").run();
+ assert.equal((await call('/api/plans',{cookie,body:{period:'2026-09',branchIds:['branch-acassuso'],plan:offer}})).status,400);
+ assert.equal((await call(`/api/payments/context?memberId=${continuedId}&paidOn=2026-09-30`,{cookie})).status,404);
+ assert.equal((await call('/api/collections?period=2026-09&branch=all',{cookie})).body.total,0);
+ console.log('PASS: attendance continuity across branches, restart confirmation, real receipt dates, automatic installment, contract price protection, monthly multi-branch catalog, custom plans and permissions.');
+}finally{await worker.dispose();}
+process.exit(0);

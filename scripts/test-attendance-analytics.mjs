@@ -1,0 +1,23 @@
+import assert from "node:assert/strict";
+import {attendanceRanges,buildAttendanceAnalytics,matchesFrequency,observedThrough,rankAttendance,monthEnd} from "../lib/attendance-analytics.ts";
+
+const person=(id,days,reviewDates=[])=>({name:id,normalizedName:id,sourceNames:[id],memberId:id,memberName:id,memberStatus:"active",otherBranch:false,dates:days.map(d=>`2026-09-${String(d).padStart(2,"0")}`),reviewDates,duplicates:0});
+const rows=[person("ANA",[1,8,15,15]),person("BETO",[2,3,4,5,6,9,12]),person("CARLA",[1,2,3,4,5,6,7,8,9,10]),person("DIEGO",[1,2,16,22]),person("MARCA PENDIENTE",[],["2026-09-03 (marca 2)"])];
+const cohort=[...rows.map(p=>({id:p.memberId,name:p.name,normalizedName:p.name,state:"A",review:[]})),{id:"CERO",name:"CERO",normalizedName:"CERO",state:"R",review:[]},{id:"BAJA",name:"BAJA",normalizedName:"BAJA",state:"B",review:[]},{id:"SIN ESTADO",name:"SIN ESTADO",normalizedName:"SIN ESTADO",state:"",review:[]}];
+const input={period:"2026-09",syncedAt:"2026-09-23T12:00:00Z",today:"2026-09-23",rows,cohort,visitors:[{name:"VISITANTE",normalizedName:"VISITANTE",declaredAt:"2026-09-22T15:00:00Z"},{name:"FUTURO",normalizedName:"FUTURO",declaredAt:"2026-10-01T15:00:00Z"}],periods:[{period:"2026-01",syncedAt:"2026-09-23T12:00:00Z"},{period:"2026-02",syncedAt:"2026-09-23T12:00:00Z"},{period:"2026-09",syncedAt:"2026-09-23T12:00:00Z"}],counts:[{date:"2026-01-01",total:310},{date:"2026-02-01",total:280}]};
+const a=buildAttendanceAnalytics(input);
+assert.equal(a.total,24,"Count each person once per day.");assert.equal(a.daily.length,23,"Exclude future days.");
+assert.equal(a.averageDaily,24/23);assert.equal(a.averageWeekly,168/23);assert.equal(a.averageMonthly,295,"Exclude the current partial month from the monthly average.");
+assert.equal(a.zeroExpected,2,"Include eligible zero-attendance members and confirmed visitors, not inactive members or unresolved marks.");
+assert.equal(a.people.some(p=>p.id==="member:BAJA"||p.id==="member:SIN ESTADO"||p.displayName==="FUTURO"),false);
+assert.deepEqual(["zero","under-one","one","two","three-plus"].map(f=>a.people.filter(p=>matchesFrequency(p,f)).map(p=>p.displayName).sort()),[["CERO","VISITANTE"],["ANA"],["DIEGO"],["BETO"],["CARLA"]]);
+assert.equal(a.people.find(p=>p.displayName==="MARCA PENDIENTE").weeklyAverage,null);
+assert.deepEqual(attendanceRanges("2026-09","2026-09-23","week").map(r=>[r.start,r.end,r.days]),[["2026-09-01","2026-09-06",6],["2026-09-07","2026-09-13",7],["2026-09-14","2026-09-20",7],["2026-09-21","2026-09-23",3]]);
+const halves=attendanceRanges("2026-09","2026-09-23","fortnight");assert.deepEqual(halves.map(h=>h.days),[15,8]);
+assert.equal(rankAttendance(a.people,halves[1],{query:"",frequency:"all",sort:"most",onlyReview:false})[0].displayName,"DIEGO");
+assert.equal(rankAttendance(a.people,halves[0],{query:"",frequency:"all",sort:"most",onlyReview:false})[0].displayName,"CARLA");
+assert.equal(rankAttendance(a.people,halves[1],{query:"ana",frequency:"under-one",sort:"most",onlyReview:false})[0].rangeTotal,0,"Monthly frequency remains independent of the ranking range.");
+assert.equal(observedThrough("2026-09","2026-09-23T01:30:00Z","2026-09-23"),"2026-09-22","Use Argentina's calendar date, not UTC.");
+assert.equal(monthEnd("2028-02"),"2028-02-29");
+const partial=buildAttendanceAnalytics({...input,period:"2026-01",syncedAt:"2026-01-15T15:00:00Z",rows:[],cohort:[],periods:[{period:"2026-01",syncedAt:"2026-01-15T15:00:00Z"}]});assert.equal(partial.averageMonthly,null);assert.equal(partial.elapsedDays,15);
+console.log("PASS: zero-member cohort, exact frequency bands, calendar/partial periods, normalized averages, deduplication, timezone cutoff and ranking independent of monthly frequency.");

@@ -1,0 +1,33 @@
+CREATE TABLE `sales_plan_scenarios` (
+	`id` text PRIMARY KEY NOT NULL,
+	`period` text NOT NULL,
+	`sale_on` text NOT NULL,
+	`branch_id` text NOT NULL,
+	`plan_id` text NOT NULL,
+	`plan_label` text NOT NULL,
+	`service` text NOT NULL,
+	`currency` text NOT NULL,
+	`months` integer NOT NULL,
+	`installments` integer NOT NULL,
+	`method` text NOT NULL,
+	`quantity` integer NOT NULL,
+	`amount_cents` integer NOT NULL,
+	`surcharge_bps` integer NOT NULL,
+	`sales_vat_ppm` integer DEFAULT 210000 NOT NULL,
+	`collection_fee_ppm` integer,
+	`collection_fee_vat_ppm` integer,
+	`financing_fee_ppm` integer,
+	`financing_fee_vat_ppm` integer,
+	`other_cost_ppm` integer,
+	`other_tax_ppm` integer,
+	`iibb_retention_ppm` integer,
+	`fixed_cost_cents` integer,
+	`accreditation_days` integer,
+	`provider` text,
+	`updated_by` text NOT NULL,
+	`updated_at` text NOT NULL,
+	FOREIGN KEY (`branch_id`) REFERENCES `branches`(`id`) ON UPDATE no action ON DELETE no action,
+	FOREIGN KEY (`updated_by`) REFERENCES `employees`(`id`) ON UPDATE no action ON DELETE no action
+);
+--> statement-breakpoint
+CREATE INDEX `idx_sales_plan_scenarios_period` ON `sales_plan_scenarios` (`period`,`branch_id`);

@@ -1,0 +1,1 @@
+CREATE INDEX `idx_audit_logs_entity_action` ON `audit_logs` (`entity_type`,`entity_id`,`action`);
